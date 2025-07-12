@@ -1,4 +1,10 @@
+use std::collections::HashMap;
+use std::env;
+use std::io::{Read, Write};
+use std::mem::{Discriminant, discriminant};
+
 use thiserror::Error;
+extern crate paste;
 /*
  *
  *  Custom assembly:
@@ -22,6 +28,12 @@ use thiserror::Error;
  *
  */
 
+fn convert_case(lexeme: &str) -> String {
+    let mut str = String::from(lexeme.as_bytes()[0] as char).to_ascii_uppercase();
+    str.push_str(&lexeme[1..]);
+    str
+}
+
 macro_rules! define_mnemonics {
     ( $( $name:ident ),* ) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,9 +42,9 @@ macro_rules! define_mnemonics {
         }
 
         impl Mnemonic {
-            pub fn from_str(s: &str) -> Option<Self> {
-                match s.to_lowercase().as_str() {
-                    $( stringify!($name.to_lowercase()) => Some(Mnemonic::$name), )*
+            pub fn try_from_str(s: &str) -> Option<Self> {
+                match convert_case(s).as_str() {
+                    $( stringify!($name) => Some(Mnemonic::$name), )*
                     _ => None
                 }
             }
@@ -52,22 +64,50 @@ macro_rules! define_mnemonics {
     };
 }
 
-define_mnemonics!(
-    Add, Sub, Mul, Div, Xor, Or, And, Cmp, Jz, Jmp, Jnz, Load, Store, Exit
-);
+impl Mnemonic {
+    fn serialiaze(&self) -> u32 {
+        use Mnemonic::*;
+        match self {
+            // Nop
+            Nop => 0x0,
 
-const TEST: &'static str = r#"
-; program start
-start:
-    load r1, $10 ; load the decimal value 10 into r1
-    load r2, r1  ; load the value from r1 into r2
-    add r2, r1   ; add r1 and r2 and store the result in r2
-    exit
-"#;
+            // Control instructions
+            Exit => 0x1,
+            Ret => 0x2,
+            Jmp => 0x3,
+            Jz => 0x4,
+            Jnz => 0x5,
+            Call => 0x6,
+
+            // Arithmetic
+            Add => 0x7,
+            Sub => 0x8,
+            Mul => 0x9,
+            Div => 0xA,
+
+            // Logic
+            And => 0xB,
+            Or => 0xC,
+            Not => 0xD,
+            Xor => 0xE,
+            Cmp => 0xF,
+
+            // Memory
+            Load => 0x10,
+            Store => 0x11,
+        }
+    }
+}
+
+define_mnemonics!(
+    Add, Sub, Mul, Div, Xor, Or, And, Cmp, Jz, Jmp, Jnz, Load, Not, Store, Exit, Nop, Ret, Call
+);
 
 #[derive(Debug)]
 enum ParserErrorKind {
     LexerError(LexerErrorKind),
+    UnexpectedToken(TokenKind),
+    UnexpectedEof,
 }
 
 #[derive(Error, Debug)]
@@ -90,19 +130,44 @@ struct LexerError {
     error_kind: LexerErrorKind,
 }
 
+impl std::fmt::Display for LexerErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            LexerErrorKind::UnexpectedSymbol(char) => {
+                f.write_fmt(format_args!("encountered unexpected symbol \"{char}\""))
+            }
+            LexerErrorKind::MalformedInteger(char) => f.write_fmt(format_args!(
+                "Malformed integer! expected a numeric character, found \"{char}\""
+            )),
+        }
+    }
+}
+
 impl std::fmt::Display for LexerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "Lexer Error at: ({}, {})\nerror: {:?}",
+            "Lexer Error at: ({}, {})\nerror: {}",
             self.line, self.col, self.error_kind
         ))
+    }
+}
+
+impl std::fmt::Display for ParserErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            ParserErrorKind::UnexpectedEof => f.write_fmt(format_args!("unexpected end of file!")),
+            ParserErrorKind::LexerError(l) => f.write_fmt(format_args!("{l}")),
+            ParserErrorKind::UnexpectedToken(token) => {
+                f.write_fmt(format_args!("encountered an unexpected token: {token:#?}"))
+            }
+        }
     }
 }
 
 impl std::fmt::Display for ParserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "Parser Error at: ({}, {})\nerror: {:?}",
+            "Parser Error at: ({}, {})\nerror: {}",
             self.line, self.col, self.error_kind
         ))
     }
@@ -125,7 +190,7 @@ struct Token {
     token_kind: TokenKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Register {
     R1,
     R2,
@@ -158,21 +223,50 @@ enum Register {
     R29,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TokenKind {
-    Immediate(u64),
-    Address(Register),
+    Immediate([u8; 8]),
     Register(Register),
     Label(String),
     Mnemonic(Mnemonic),
     Comma,
     Colon,
+    Dollar,
+    Pound,
+}
+
+// Words are serialized as a little-endian sequence of bytes
+fn serialize_word(word: &u64) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    bytes
+        .iter_mut()
+        .enumerate()
+        .for_each(|(i, b)| *b = ((*word >> (i * 8)) & 255) as u8);
+    bytes
+}
+
+fn serialize_half_word(half_word: u32) -> [u8; 4] {
+    let mut bytes = [0; 4];
+    bytes
+        .iter_mut()
+        .enumerate()
+        .for_each(|(i, b)| *b = ((half_word >> (i * 8)) & 255) as u8);
+    bytes
+}
+
+fn serialize_u16(arg: u16) -> [u8; 2] {
+    let mut bytes = [0; 2];
+    bytes
+        .iter_mut()
+        .enumerate()
+        .for_each(|(i, b)| *b = ((arg >> (i * 8)) & 255) as u8);
+    bytes
 }
 
 fn scan_number(lexeme: &str) -> Result<u64, usize> {
     if let Some(hex) = lexeme.strip_prefix("0x") {
         let mut i = hex.chars().enumerate();
-        let _ = loop {
+        loop {
             if let Some((pos, c)) = i.next() {
                 if !c.is_numeric() && !"abcdefABCDEF".contains(c) {
                     break Err(pos + 2);
@@ -184,7 +278,7 @@ fn scan_number(lexeme: &str) -> Result<u64, usize> {
         Ok(u64::from_str_radix(hex, 16).unwrap())
     } else if let Some(bin) = lexeme.strip_prefix("0b") {
         let mut i = bin.chars().enumerate();
-        let _ = loop {
+        loop {
             if let Some((pos, c)) = i.next() {
                 if !"01".contains(c) {
                     break Err(pos + 2);
@@ -196,7 +290,7 @@ fn scan_number(lexeme: &str) -> Result<u64, usize> {
         Ok(u64::from_str_radix(bin, 2).unwrap())
     } else {
         let mut i = lexeme.chars().enumerate();
-        let _ = loop {
+        loop {
             if let Some((pos, c)) = i.next() {
                 if !c.is_numeric() {
                     break Err(pos);
@@ -205,7 +299,7 @@ fn scan_number(lexeme: &str) -> Result<u64, usize> {
                 break Ok(());
             }
         }?;
-        Ok(u64::from_str_radix(lexeme, 10).unwrap())
+        Ok(lexeme.parse::<u64>().unwrap())
     }
 }
 
@@ -259,11 +353,12 @@ fn make_token(
     line: usize,
     _col: usize,
 ) -> Result<Option<Token>, LexerError> {
-    if start == end {
+    if end < start {
         Ok(None)
     } else {
         let lexeme = &asm[*start..=*end];
         *start = *end;
+        println!("{_col}, {lexeme}");
         let col = _col - lexeme.len();
         if let Some(numeric) = lexeme.strip_prefix("$") {
             scan_number(numeric)
@@ -271,13 +366,13 @@ fn make_token(
                     Some(Token {
                         line,
                         col,
-                        token_kind: TokenKind::Immediate(num),
+                        token_kind: TokenKind::Immediate(serialize_word(&num)),
                     })
                 })
                 .map_err(|err| LexerError {
                     line,
                     col: _col + err,
-                    error_kind: LexerErrorKind::UnexpectedSymbol(lexeme.as_bytes()[err] as char),
+                    error_kind: LexerErrorKind::MalformedInteger(lexeme.as_bytes()[err] as char),
                 })
         } else {
             Ok(if let Some(reg) = scan_register(lexeme) {
@@ -286,7 +381,7 @@ fn make_token(
                     col,
                     token_kind: TokenKind::Register(reg),
                 })
-            } else if let Some(mnemonic) = Mnemonic::from_str(lexeme) {
+            } else if let Some(mnemonic) = Mnemonic::try_from_str(lexeme) {
                 Some(Token {
                     line,
                     col,
@@ -305,28 +400,31 @@ fn make_token(
 
 fn tokenise(asm: &str) -> Result<Vec<Token>, LexerError> {
     let mut token_stream = vec![];
-    let mut i = asm.chars();
+    let mut i = asm.chars().enumerate();
     let (mut start, mut end) = (0usize, 0usize);
     let (mut line, mut col) = (1usize, 1usize);
-    'outer: while let Some(c) = i.next() {
+    'outer: while let Some((idx, c)) = i.next() {
         if c.is_whitespace() {
-            if let Some(token) = make_token(asm, &mut start, &mut end, line, col)? {
+            if start != idx
+                && let Some(token) = make_token(asm, &mut start, &mut end, line, col)?
+            {
                 token_stream.push(token);
             }
             if c == '\n' {
                 line += 1;
-                col = 1;
+                col = 0;
             }
-            start += 1;
-            end = start;
+            start = idx + 1;
+            end = idx;
         } else if c == ';' {
             if let Some(token) = make_token(asm, &mut start, &mut end, line, col)? {
                 token_stream.push(token);
             }
-            while let Some(c) = i.next() {
+            for (idx, c) in i.by_ref() {
                 if c == '\n' {
                     line += 1;
                     col = 1;
+                    start = idx + 1;
                     continue 'outer;
                 }
             }
@@ -339,8 +437,8 @@ fn tokenise(asm: &str) -> Result<Vec<Token>, LexerError> {
                 col,
                 token_kind: TokenKind::Comma,
             });
-            start += 1;
-            end = start;
+            start = idx + 1;
+            end = idx;
         } else if c == ':' {
             if let Some(token) = make_token(asm, &mut start, &mut end, line, col)? {
                 token_stream.push(token);
@@ -350,10 +448,26 @@ fn tokenise(asm: &str) -> Result<Vec<Token>, LexerError> {
                 col,
                 token_kind: TokenKind::Colon,
             });
-            start += 1;
-            end = start;
+            start = idx + 1;
+            end = idx;
+        } else if c == '$' {
+            token_stream.push(Token {
+                line,
+                col,
+                token_kind: TokenKind::Dollar,
+            });
+            start = idx + 1;
+            end = idx;
+        } else if c == '#' {
+            token_stream.push(Token {
+                line,
+                col,
+                token_kind: TokenKind::Pound,
+            });
+            start = idx + 1;
+            end = idx;
         } else if c.is_alphanumeric() {
-            end += 1;
+            end = idx;
         } else {
             return Err(LexerError {
                 line,
@@ -363,15 +477,330 @@ fn tokenise(asm: &str) -> Result<Vec<Token>, LexerError> {
         }
         col += 1;
     }
+    if let Some(tok) = make_token(asm, &mut start, &mut end, line, col)? {
+        token_stream.push(tok);
+    }
     Ok(token_stream)
 }
 
-fn parse_assembly(asm: &str) -> Result<Vec<u64>, ParserError> {
-    Ok(vec![])
+fn reg_to_binary(reg: Register) -> u8 {
+    match reg {
+        Register::R1 => 0,
+        Register::R2 => 1,
+        Register::R3 => 2,
+        Register::R4 => 3,
+        Register::R5 => 4,
+        Register::R6 => 5,
+        Register::R7 => 6,
+        Register::R8 => 7,
+        Register::R9 => 8,
+        Register::R10 => 9,
+        Register::R11 => 10,
+        Register::R12 => 11,
+        Register::R13 => 12,
+        Register::R14 => 13,
+        Register::R15 => 14,
+        Register::R16 => 15,
+        Register::R17 => 16,
+        Register::R18 => 17,
+        Register::R19 => 18,
+        Register::R20 => 19,
+        Register::R21 => 20,
+        Register::R22 => 21,
+        Register::R23 => 22,
+        Register::R24 => 23,
+        Register::R25 => 24,
+        Register::R26 => 25,
+        Register::R27 => 26,
+        Register::R28 => 27,
+        Register::R29 => 28,
+    }
+}
+
+// Replace with a better name dumbass
+enum Serialized {
+    Empty,
+    Pound,
+    Comma,
+    Dollar,
+    Colon,
+    Register(u8),
+    Immediate([u8; 8]),
+}
+
+fn expect_token<I>(
+    iter: &mut I,
+    expected: &[Discriminant<TokenKind>],
+    sym_table: &HashMap<String, u64>,
+) -> Result<Serialized, ParserError>
+where
+    I: Iterator<Item = Token>,
+{
+    if let Some(tok) = iter.next() {
+        if expected.iter().any(|d| d == &discriminant(&tok.token_kind)) {
+            Ok(match tok.token_kind {
+                TokenKind::Immediate(val) => Serialized::Immediate(val),
+                TokenKind::Register(r) => Serialized::Register(reg_to_binary(r)),
+                TokenKind::Comma => Serialized::Comma,
+                TokenKind::Colon => Serialized::Colon,
+                TokenKind::Pound => Serialized::Pound,
+                TokenKind::Dollar => Serialized::Dollar,
+                TokenKind::Label(label) => {
+                    sym_table.get(&label).map_or(Serialized::Empty, |word| {
+                        Serialized::Immediate(serialize_word(word))
+                    })
+                }
+                TokenKind::Mnemonic(_) => unreachable!("shouldn't have to decode mnemonics here!"),
+            })
+        } else {
+            Err(ParserError {
+                line: tok.line,
+                col: tok.col,
+                error_kind: ParserErrorKind::UnexpectedToken(tok.token_kind.to_owned()),
+            })
+        }
+    } else {
+        Err(ParserError {
+            line: 0,
+            col: 0,
+            error_kind: ParserErrorKind::UnexpectedEof,
+        })
+    }
+}
+
+fn parse_instruction<I>(
+    mnemonic: Mnemonic,
+    iter: &mut I,
+    bytes: &mut Vec<u8>,
+    sym_table: &HashMap<String, u64>,
+) -> Result<(), ParserError>
+where
+    I: Iterator<Item = Token>,
+{
+    use Mnemonic::*;
+    let mut instruction_half_word = mnemonic.serialiaze();
+    match mnemonic {
+        Add | Sub | Mul | Xor | Or | Load | Store | Div | And | Cmp => {
+            // set op1 mode to 1 (register)
+            instruction_half_word |= 1 << 9;
+            // get the first operand
+            match expect_token(
+                iter,
+                &[discriminant(&TokenKind::Register(Register::R1))],
+                sym_table,
+            )? {
+                Serialized::Register(r) => {
+                    // leave the first 13 bits untouched and set op1 at the 13-18th bits
+                    instruction_half_word |= (r as u32) << 13;
+                }
+                _ => unreachable!("expected a register!"),
+            };
+            // consume the mandatory comma seperating the operands
+            expect_token(iter, &[discriminant(&TokenKind::Comma)], sym_table)?;
+            // get the second operand
+            match expect_token(
+                iter,
+                &[
+                    discriminant(&TokenKind::Register(Register::R1)),
+                    discriminant(&TokenKind::Pound),
+                    discriminant(&TokenKind::Dollar),
+                ],
+                sym_table,
+            )? {
+                Serialized::Register(r) => {
+                    // set op2 mode to 1 (register)
+                    instruction_half_word |= 1 << 11;
+                    // leave the first 18 bits alone and set op2 at the 18-23th bits
+                    instruction_half_word |= (r as u32) << 18;
+                    // the entire instruction (incl. both operands) fits nicely in the first 24 bits
+                    // (the last bit is a pad) of a u32 so we serialize it and write the last
+                    // 3 bytes (cause little endian,
+                    // meaning the first byte is gonna be all zeroes)
+                    bytes.extend_from_slice(&serialize_half_word(instruction_half_word)[1..]);
+                }
+                Serialized::Pound => {
+                    // set op2 mode to 2 (register indirect)
+                    instruction_half_word |= 2 << 11;
+                    // get second operand
+                    match expect_token(
+                        iter,
+                        &[discriminant(&TokenKind::Register(Register::R1))],
+                        sym_table,
+                    )? {
+                        Serialized::Register(r) => {
+                            // leave the first 18 bits alone and set op2 at the 18-23th bits
+                            instruction_half_word |= (r as u32) << 18;
+                            // the entire instruction (incl. both operands) fit nicely in the first 24 bits
+                            // of a u32 so we serialize it and write the last 3 bytes (cause little endian,
+                            // meaning the first byte is gonna be all zeroes)
+                            bytes.extend_from_slice(
+                                &serialize_half_word(instruction_half_word)[1..],
+                            );
+                        }
+                        _ => unreachable!("expected a register!"),
+                    }
+                }
+                Serialized::Dollar => {
+                    // set op2 mode to 3 (immediate)
+                    instruction_half_word |= 3 << 11;
+                    // get second operand
+                    match expect_token(
+                        iter,
+                        &[discriminant(&TokenKind::Immediate([0; 8]))],
+                        sym_table,
+                    )? {
+                        Serialized::Immediate(arg) => {
+                            // we can't fit the second instruction in a u32 so we pad the 5
+                            // remaining bits (18 to 24) with 0 (already 0 so do nothing),
+                            // then push the last 3 bytes (again, cause little endian)
+                            // of the serialized u32
+                            bytes.extend_from_slice(
+                                &serialize_half_word(instruction_half_word)[1..],
+                            );
+                            // then we serialize the 64 bit word into a sequence of bytes
+                            // (TODO:
+                            // an immediate value doesn't necessarily mean its a 64-bit word
+                            // so we should perhaps add a way of distinguishing different width
+                            // arguments thus spacing space)
+                            bytes.extend_from_slice(&arg);
+                        }
+                        _ => unreachable!("expected a sequence of bytes!"),
+                    }
+                }
+                _ => unreachable!("expected one of (register, pound sign, dollar sign)!"),
+            }
+        }
+        Jmp | Jnz | Jz | Not | Call => {
+            // these instructions only have one argument
+            // get the first argument
+            match expect_token(
+                iter,
+                &[
+                    discriminant(&TokenKind::Register(Register::R1)),
+                    discriminant(&TokenKind::Pound),
+                    discriminant(&TokenKind::Dollar),
+                ],
+                sym_table,
+            )? {
+                Serialized::Register(r) => {
+                    // set op1 mode to 1 (register)
+                    instruction_half_word |= 1 << 9;
+                    // since these instructions don't have a second argument,
+                    // we can write the register into the 11th-16th bits of the u32 (then cast to
+                    // u16 cause we only need 16 bits here)
+                    instruction_half_word |= (r as u32) << 11;
+                    // the entire instruction (incl. both operands) fits nicely into a u16 so we
+                    // serialize and write the bytes out
+                    bytes.extend_from_slice(&serialize_u16(instruction_half_word as u16));
+                }
+                Serialized::Pound => {
+                    // set op1 mode to 2 (register indirect)
+                    instruction_half_word |= 2 << 9;
+                    // get second operand
+                    match expect_token(
+                        iter,
+                        &[discriminant(&TokenKind::Register(Register::R1))],
+                        sym_table,
+                    )? {
+                        Serialized::Register(r) => {
+                            // since these instructions don't have a second argument,
+                            // we can write the register into the 11th-16th bits of the u32 (then cast to
+                            // u16 cause we only need 16 bits here)
+                            instruction_half_word |= (r as u32) << 11;
+                            // the entire instruction (incl. both operands) fits nicely into a u16 so we
+                            // serialize and write the bytes out
+                            bytes.extend_from_slice(&serialize_u16(instruction_half_word as u16));
+                        }
+                        _ => unreachable!("expected a register!"),
+                    }
+                }
+                Serialized::Dollar => {
+                    // set op1 mode to 3 (immediate)
+                    instruction_half_word |= 3 << 9;
+                    // get actual operand
+                    match expect_token(
+                        iter,
+                        &[discriminant(&TokenKind::Immediate([0; 8]))],
+                        sym_table,
+                    )? {
+                        Serialized::Immediate(arg) => {
+                            // the operand is a u64 so we push the first 16 bits (9 for the ins, 2
+                            // for the operand mode and the remaining 5 bits as a pad)
+                            bytes.extend_from_slice(
+                                &serialize_u16(instruction_half_word as u16)
+                            );
+                            // then we serialize the 64 bit word into a sequence of bytes
+                            // (TODO:
+                            // an immediate value doesn't necessarily mean its a 64-bit word
+                            // so we should perhaps add a way of distinguishing different width
+                            // arguments thus spacing space)
+                            bytes.extend_from_slice(&arg);
+                        }
+                        _ => unreachable!("expected a sequence of bytes!"),
+                    }
+                }
+                _ => unreachable!("expected one of (register, pound sign, dollar sign)!")
+            }
+        }
+        Exit | Nop | Ret => {
+            // these instructions take no operands so we write out the first 16 bits (9 for the
+            // ins and the remaining 7 as a pad)
+            bytes.extend_from_slice(&serialize_u16(instruction_half_word as u16));
+        }
+    }
+    Ok(())
+}
+
+fn parse_assembly(asm: &str) -> Result<Vec<u8>, ParserError> {
+    let mut bytes = Vec::new();
+    let mut sym_table = HashMap::<String, u64>::new();
+    let tokens = tokenise(asm)?;
+    let mut token_iter = tokens.into_iter();
+    while let Some(Token {
+        line,
+        col,
+        token_kind,
+    }) = token_iter.next()
+    {
+        match token_kind {
+            TokenKind::Label(label) => {
+                expect_token(
+                    &mut token_iter,
+                    &[discriminant(&TokenKind::Colon)],
+                    &sym_table,
+                )
+                .map(|_| {
+                    sym_table.insert(label, bytes.len() as u64);
+                })?;
+            }
+            TokenKind::Mnemonic(mnemonic) => {
+                parse_instruction(mnemonic, &mut token_iter, &mut bytes, &sym_table)?;
+            }
+            _ => {
+                return Err(ParserError {
+                    line,
+                    col,
+                    error_kind: ParserErrorKind::UnexpectedToken(token_kind),
+                });
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 #[test]
 fn test_lexer() -> Result<(), LexerError> {
+    const TEST: &'static str = r#"; program start
+start:
+    load r1, $10 ; load the decimal value 10 into r1
+    load r2, r1  ; load the value from r1 into r2
+    add r2, r1   ; add r1 and r2 and store the result in r2
+    exit
+r:
+    nop
+    add r30, #r1
+    ret
+"#;
     tokenise(TEST).map(|tokens| {
         for token in tokens {
             dbg!(token);
@@ -379,6 +808,18 @@ fn test_lexer() -> Result<(), LexerError> {
     })
 }
 
-fn main() {
-    println!("Hello, world!");
+fn main() -> std::io::Result<()> {
+    for arg in env::args().skip(1) {
+        let mut file = std::fs::File::open(&arg)?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        match parse_assembly(&buf) {
+            Ok(bytes) => {
+                let mut outfile = std::fs::File::open(format!("{arg}.out"))?;
+                outfile.write_all(bytes.as_slice())?;
+            }
+            Err(err) => eprintln!("{err}"),
+        }
+    }
+    Ok(())
 }
