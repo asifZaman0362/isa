@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
-use std::mem::{Discriminant, discriminant};
 
+use paste::paste;
 use thiserror::Error;
-extern crate paste;
 /*
  *
  *  Custom assembly:
@@ -103,74 +102,59 @@ define_mnemonics!(
     Add, Sub, Mul, Div, Xor, Or, And, Cmp, Jz, Jmp, Jnz, Load, Not, Store, Exit, Nop, Ret, Call
 );
 
-#[derive(Debug)]
+macro_rules! enum_with_names {
+    ($name:ident { 
+        $($variant:ident $( ($type:ty) )*),*
+    }) => {
+        #[derive(Debug, Clone)]
+        enum $name {
+            $( $variant $(($type))? ),*
+        }
+
+        impl $name {
+            const fn to_str(&self) -> &'static str {
+                paste! {
+                    match self {
+                        $( $name::$variant $(([<_ $type:lower>]))? => stringify!($variant) ),*
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Error)]
 enum ParserErrorKind {
-    LexerError(LexerErrorKind),
-    UnexpectedToken(TokenKind),
+    #[error(transparent)]
+    LexerError(#[from] LexerErrorKind),
+    #[error("expected {1:?} but found {0:?} instead")]
+    UnexpectedToken(TokenKind, Vec<&'static str>),
+    #[error("unexpectedly reached end of file")]
     UnexpectedEof,
 }
 
 #[derive(Error, Debug)]
+#[error("Error parsing at {line}:{col} :: {error_kind:?}")]
 struct ParserError {
     line: usize,
     col: usize,
     error_kind: ParserErrorKind,
 }
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 enum LexerErrorKind {
+    #[error("unexpected symbol {0}")]
     UnexpectedSymbol(char),
+    #[error("expected a valid digit found '{0}' instead")]
     MalformedInteger(char),
 }
 
 #[derive(Error, Debug)]
+#[error("Invalid syntax at {line}:{col} :: {error_kind:?}")]
 struct LexerError {
     line: usize,
     col: usize,
     error_kind: LexerErrorKind,
-}
-
-impl std::fmt::Display for LexerErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            LexerErrorKind::UnexpectedSymbol(char) => {
-                f.write_fmt(format_args!("encountered unexpected symbol \"{char}\""))
-            }
-            LexerErrorKind::MalformedInteger(char) => f.write_fmt(format_args!(
-                "Malformed integer! expected a numeric character, found \"{char}\""
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for LexerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "Lexer Error at: ({}, {})\nerror: {}",
-            self.line, self.col, self.error_kind
-        ))
-    }
-}
-
-impl std::fmt::Display for ParserErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self {
-            ParserErrorKind::UnexpectedEof => f.write_fmt(format_args!("unexpected end of file!")),
-            ParserErrorKind::LexerError(l) => f.write_fmt(format_args!("{l}")),
-            ParserErrorKind::UnexpectedToken(token) => {
-                f.write_fmt(format_args!("encountered an unexpected token: {token:#?}"))
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for ParserError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "Parser Error at: ({}, {})\nerror: {}",
-            self.line, self.col, self.error_kind
-        ))
-    }
 }
 
 impl From<LexerError> for ParserError {
@@ -223,17 +207,41 @@ enum Register {
     R29,
 }
 
-#[derive(Debug, Clone)]
-enum TokenKind {
-    Immediate([u8; 8]),
+enum_with_names!(TokenKind {
+    Immediate(u64),
     Register(Register),
     Label(String),
     Mnemonic(Mnemonic),
     Comma,
     Colon,
     Dollar,
-    Pound,
+    Pound
+});
+
+macro_rules! discriminate {
+    ( $name:ident ) => {
+        paste! {
+            const [<$name:upper _T>]: TokenKind = TokenKind::$name;
+            const [<$name:upper>] : &'static str = &[<$name:upper _T>].to_str();
+        }
+    };
+    ( $name:ident, $value:expr ) => {
+        paste! {
+            const [<$name:upper _T>]: &'static TokenKind = &TokenKind::$name($value);
+            const [<$name:upper>] : &'static str = &[<$name:upper _T>].to_str();
+        }
+    }
 }
+
+discriminate!(Immediate, 0);
+discriminate!(Label, String::new());
+discriminate!(Register, Register::R1);
+discriminate!(Mnemonic, Mnemonic::Add);
+discriminate!(Comma);
+discriminate!(Colon);
+discriminate!(Dollar);
+discriminate!(Pound);
+
 
 // Words are serialized as a little-endian sequence of bytes
 fn serialize_word(word: &u64) -> [u8; 8] {
@@ -366,7 +374,7 @@ fn make_token(
                     Some(Token {
                         line,
                         col,
-                        token_kind: TokenKind::Immediate(serialize_word(&num)),
+                        token_kind: TokenKind::Immediate(num),
                     })
                 })
                 .map_err(|err| LexerError {
@@ -530,16 +538,16 @@ enum Serialized {
 
 fn expect_token<I>(
     iter: &mut I,
-    expected: &[Discriminant<TokenKind>],
+    expected: &[&'static str],
     sym_table: &HashMap<String, u64>,
 ) -> Result<Serialized, ParserError>
 where
     I: Iterator<Item = Token>,
 {
     if let Some(tok) = iter.next() {
-        if expected.iter().any(|d| d == &discriminant(&tok.token_kind)) {
+        if expected.iter().any(|d| *d == tok.token_kind.to_str()) {
             Ok(match tok.token_kind {
-                TokenKind::Immediate(val) => Serialized::Immediate(val),
+                TokenKind::Immediate(val) => Serialized::Immediate(serialize_word(&val)),
                 TokenKind::Register(r) => Serialized::Register(reg_to_binary(r)),
                 TokenKind::Comma => Serialized::Comma,
                 TokenKind::Colon => Serialized::Colon,
@@ -556,7 +564,10 @@ where
             Err(ParserError {
                 line: tok.line,
                 col: tok.col,
-                error_kind: ParserErrorKind::UnexpectedToken(tok.token_kind.to_owned()),
+                error_kind: ParserErrorKind::UnexpectedToken(
+                    tok.token_kind.to_owned(),
+                    Vec::from(expected),
+                ),
             })
         }
     } else {
@@ -586,7 +597,7 @@ where
             // get the first operand
             match expect_token(
                 iter,
-                &[discriminant(&TokenKind::Register(Register::R1))],
+                &[REGISTER],
                 sym_table,
             )? {
                 Serialized::Register(r) => {
@@ -596,14 +607,14 @@ where
                 _ => unreachable!("expected a register!"),
             };
             // consume the mandatory comma seperating the operands
-            expect_token(iter, &[discriminant(&TokenKind::Comma)], sym_table)?;
+            expect_token(iter, &[COMMA], sym_table)?;
             // get the second operand
             match expect_token(
                 iter,
                 &[
-                    discriminant(&TokenKind::Register(Register::R1)),
-                    discriminant(&TokenKind::Pound),
-                    discriminant(&TokenKind::Dollar),
+                    REGISTER,
+                    POUND,
+                    DOLLAR
                 ],
                 sym_table,
             )? {
@@ -624,7 +635,7 @@ where
                     // get second operand
                     match expect_token(
                         iter,
-                        &[discriminant(&TokenKind::Register(Register::R1))],
+                        &[REGISTER],
                         sym_table,
                     )? {
                         Serialized::Register(r) => {
@@ -646,7 +657,7 @@ where
                     // get second operand
                     match expect_token(
                         iter,
-                        &[discriminant(&TokenKind::Immediate([0; 8]))],
+                        &[IMMEDIATE],
                         sym_table,
                     )? {
                         Serialized::Immediate(arg) => {
@@ -676,9 +687,9 @@ where
             match expect_token(
                 iter,
                 &[
-                    discriminant(&TokenKind::Register(Register::R1)),
-                    discriminant(&TokenKind::Pound),
-                    discriminant(&TokenKind::Dollar),
+                    REGISTER,
+                    POUND,
+                    DOLLAR
                 ],
                 sym_table,
             )? {
@@ -699,7 +710,7 @@ where
                     // get second operand
                     match expect_token(
                         iter,
-                        &[discriminant(&TokenKind::Register(Register::R1))],
+                        &[REGISTER],
                         sym_table,
                     )? {
                         Serialized::Register(r) => {
@@ -720,15 +731,13 @@ where
                     // get actual operand
                     match expect_token(
                         iter,
-                        &[discriminant(&TokenKind::Immediate([0; 8]))],
+                        &[IMMEDIATE],
                         sym_table,
                     )? {
                         Serialized::Immediate(arg) => {
                             // the operand is a u64 so we push the first 16 bits (9 for the ins, 2
                             // for the operand mode and the remaining 5 bits as a pad)
-                            bytes.extend_from_slice(
-                                &serialize_u16(instruction_half_word as u16)
-                            );
+                            bytes.extend_from_slice(&serialize_u16(instruction_half_word as u16));
                             // then we serialize the 64 bit word into a sequence of bytes
                             // (TODO:
                             // an immediate value doesn't necessarily mean its a 64-bit word
@@ -739,7 +748,7 @@ where
                         _ => unreachable!("expected a sequence of bytes!"),
                     }
                 }
-                _ => unreachable!("expected one of (register, pound sign, dollar sign)!")
+                _ => unreachable!("expected one of (register, pound sign, dollar sign)!"),
             }
         }
         Exit | Nop | Ret => {
@@ -766,7 +775,7 @@ fn parse_assembly(asm: &str) -> Result<Vec<u8>, ParserError> {
             TokenKind::Label(label) => {
                 expect_token(
                     &mut token_iter,
-                    &[discriminant(&TokenKind::Colon)],
+                    &[COLON],
                     &sym_table,
                 )
                 .map(|_| {
@@ -780,7 +789,13 @@ fn parse_assembly(asm: &str) -> Result<Vec<u8>, ParserError> {
                 return Err(ParserError {
                     line,
                     col,
-                    error_kind: ParserErrorKind::UnexpectedToken(token_kind),
+                    error_kind: ParserErrorKind::UnexpectedToken(
+                        token_kind,
+                        vec![
+                            LABEL,
+                            MNEMONIC
+                        ],
+                    ),
                 });
             }
         }
