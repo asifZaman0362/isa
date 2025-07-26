@@ -4,6 +4,8 @@ use std::io::{Read, Write};
 
 use paste::paste;
 use thiserror::Error;
+
+mod instructions;
 /*
  *
  *  Custom assembly:
@@ -205,6 +207,9 @@ enum RegisterT {
     R27,
     R28,
     R29,
+    R30,
+    R31,
+    R32,
 }
 
 type StaticStr = &'static str;
@@ -345,6 +350,9 @@ fn scan_register(lexeme: &str) -> Option<RegisterT> {
                 27 => Some(RegisterT::R27),
                 28 => Some(RegisterT::R28),
                 29 => Some(RegisterT::R29),
+                30 => Some(RegisterT::R30),
+                31 => Some(RegisterT::R31),
+                32 => Some(RegisterT::R32),
                 _ => None,
             }
         } else {
@@ -527,6 +535,9 @@ fn reg_to_binary(reg: RegisterT) -> u8 {
         RegisterT::R27 => 26,
         RegisterT::R28 => 27,
         RegisterT::R29 => 28,
+        RegisterT::R30 => 29,
+        RegisterT::R31 => 30,
+        RegisterT::R32 => 31,
     }
 }
 
@@ -825,6 +836,27 @@ fn test_parser() -> Result<(), ParserError> {
         parse_assembly(ASM)?,
         [7, 8, 4, 8, 0x50, 0, 0x10, 0x20, 0, 0, 0, 0, 0, 0],
     );
+    Ok(())
+}
+
+#[derive(Error, Debug)]
+enum RuntimeError {
+    #[error("segmentation fault")]
+    Segfault,
+    #[error(transparent)]
+    ParserError(#[from] ParserError),
+}
+
+#[test]
+fn test_execution() -> Result<(), RuntimeError> {
+    const ASM: &'static str = r#"
+    loop:
+    add r1, $0x01
+    cmp r1, $0x10
+    jnz loop
+    store r1, $0x2020
+    hlt
+    "#;
     Ok(())
 }
 
