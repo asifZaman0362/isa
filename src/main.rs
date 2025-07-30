@@ -12,7 +12,7 @@ mod instructions;
  *
  *  labels:
  *  value ::= register | $<hex,dec,bin> | #register
- *  add [register] [value]
+ *  add [destination] [register] [value]
  *  sub ...
  *  mul ...
  *  div ...
@@ -80,18 +80,19 @@ impl MnemonicT {
             Jnz => 0x5,
             Call => 0x6,
 
-            // Arithmetic
-            Add => 0x7,
-            Sub => 0x8,
-            Mul => 0x9,
-            Div => 0xA,
-
-            // Logic
-            And => 0xB,
-            Or => 0xC,
-            Not => 0xD,
-            Xor => 0xE,
-            Cmp => 0xF,
+            // Arithmetic and Logic
+            Add => 0x0,
+            Sub => 0x1,
+            Mul => 0x2,
+            Div => 0x3,
+            AddS => 0x4,
+            SubS => 0x5,
+            And => 0x6,
+            Or => 0x7,
+            Xor => 0x8,
+            Cmp => 0x9,
+            OrS => 0xa,
+            Not => 0xb,
 
             // Memory
             Load => 0x10,
@@ -101,7 +102,8 @@ impl MnemonicT {
 }
 
 define_mnemonics!(
-    Add, Sub, Mul, Div, Xor, Or, And, Cmp, Jz, Jmp, Jnz, Load, Not, Store, Exit, Nop, Ret, Call
+    Add, Sub, Mul, Div, AddS, SubS, Xor, Or, And, Cmp, OrS, Jz, Jmp, Jnz, Load, Not, Store, Exit,
+    Nop, Ret, Call
 );
 
 macro_rules! enum_with_names {
@@ -215,7 +217,7 @@ enum RegisterT {
 type StaticStr = &'static str;
 
 enum_with_names!(TokenKind {
-    Immediate(u64),
+    Immediate(u32),
     Register(RegisterT),
     Label(StaticStr),
     Mnemonic(MnemonicT),
@@ -243,8 +245,7 @@ macro_rules! discriminate {
 discriminate!(Immediate, 0);
 discriminate!(Label, "");
 discriminate!(Register, RegisterT::R1);
-discriminate!(Mnemonic, MnemonicT::Add);
-discriminate!(Comma);
+discriminate!(Mnemonic, MnemonicT::Add); discriminate!(Comma);
 discriminate!(Colon);
 discriminate!(Dollar);
 discriminate!(Pound);
@@ -277,7 +278,7 @@ fn serialize_u16(arg: u16) -> [u8; 2] {
     bytes
 }
 
-fn scan_number(lexeme: &str) -> Result<u64, usize> {
+fn scan_number(lexeme: &str) -> Result<u32, usize> {
     if let Some(hex) = lexeme.strip_prefix("0x") {
         let mut i = hex.chars().enumerate();
         loop {
@@ -289,7 +290,7 @@ fn scan_number(lexeme: &str) -> Result<u64, usize> {
                 break Ok(());
             }
         }?;
-        Ok(u64::from_str_radix(hex, 16).unwrap())
+        Ok(u32::from_str_radix(hex, 16).unwrap())
     } else if let Some(bin) = lexeme.strip_prefix("0b") {
         let mut i = bin.chars().enumerate();
         loop {
@@ -301,7 +302,7 @@ fn scan_number(lexeme: &str) -> Result<u64, usize> {
                 break Ok(());
             }
         }?;
-        Ok(u64::from_str_radix(bin, 2).unwrap())
+        Ok(u32::from_str_radix(bin, 2).unwrap())
     } else {
         let mut i = lexeme.chars().enumerate();
         loop {
@@ -313,7 +314,7 @@ fn scan_number(lexeme: &str) -> Result<u64, usize> {
                 break Ok(());
             }
         }?;
-        Ok(lexeme.parse::<u64>().unwrap())
+        Ok(lexeme.parse::<u32>().unwrap())
     }
 }
 
@@ -549,10 +550,10 @@ enum Serialized {
     Dollar,
     Colon,
     Register(u8),
-    Immediate([u8; 8]),
+    Immediate(u32),
 }
 
-fn expect_token<I>(
+fn expect_token_serialized<I>(
     iter: &mut I,
     expected: &[&'static str],
     sym_table: &HashMap<&'static str, u64>,
@@ -560,22 +561,33 @@ fn expect_token<I>(
 where
     I: Iterator<Item = Token>,
 {
+    Ok(match expect_token(iter, expected, sym_table)?.token_kind {
+        TokenKind::Immediate(val) => Serialized::Immediate(val),
+        TokenKind::Register(r) => Serialized::Register(reg_to_binary(r)),
+        TokenKind::Comma => Serialized::Comma,
+        TokenKind::Colon => Serialized::Colon,
+        TokenKind::Pound => Serialized::Pound,
+        TokenKind::Dollar => Serialized::Dollar,
+        TokenKind::Label(label) => {
+            sym_table.get(&label).map_or(Serialized::Empty, |word| {
+                todo!("implement");
+            })
+        }
+        TokenKind::Mnemonic(_) => unreachable!("shouldn't have to decode mnemonics here!"),
+    })
+}
+
+fn expect_token<I>(
+    iter: &mut I,
+    expected: &[&'static str],
+    sym_table: &HashMap<&'static str, u64>,
+) -> Result<Token, ParserError>
+where
+    I: Iterator<Item = Token>,
+{
     if let Some(tok) = iter.next() {
         if expected.iter().any(|d| *d == tok.token_kind.to_str()) {
-            Ok(match tok.token_kind {
-                TokenKind::Immediate(val) => Serialized::Immediate(serialize_word(&val)),
-                TokenKind::Register(r) => Serialized::Register(reg_to_binary(r)),
-                TokenKind::Comma => Serialized::Comma,
-                TokenKind::Colon => Serialized::Colon,
-                TokenKind::Pound => Serialized::Pound,
-                TokenKind::Dollar => Serialized::Dollar,
-                TokenKind::Label(label) => {
-                    sym_table.get(&label).map_or(Serialized::Empty, |word| {
-                        Serialized::Immediate(serialize_word(word))
-                    })
-                }
-                TokenKind::Mnemonic(_) => unreachable!("shouldn't have to decode mnemonics here!"),
-            })
+            Ok(tok)
         } else {
             Err(ParserError {
                 line: tok.line,
@@ -595,23 +607,100 @@ where
     }
 }
 
+const INSTRUCTION_TYPE_SIZE: usize = 3;
+const NUM_REG: usize = 5;
+
+fn parse_alu_instruction<I>(
+    mnemonic: MnemonicT,
+    iter: &mut I,
+    sym_table: &HashMap<&'static str, u64>,
+) -> Result<u32, ParserError>
+where
+    I: Iterator<Item = Token>,
+{
+    use MnemonicT::*;
+    const ALU_INSTRUCTION_TYPE: usize = 1;
+    const ALU_INSTRUCTION_TYPE_SIZE: usize = 4;
+    const INPUT_MODE_SIZE: usize = 1;
+    let mut shift_size: usize = 32 - INSTRUCTION_TYPE_SIZE;
+    let mut instruction = 1 << shift_size;
+    shift_size -= ALU_INSTRUCTION_TYPE_SIZE;
+    let dest = match expect_token_serialized(iter, &[REGISTER], sym_table)? {
+        Serialized::Register(r) => r,
+        _ => unreachable!(
+            "shouldn't see anything other than a register at this point! bug in the expect_token fn?"
+        ),
+    };
+    instruction |= mnemonic.serialiaze() << shift_size;
+    shift_size -= NUM_REG;
+    instruction |= (dest as u32) << shift_size;
+    if mnemonic != Not {
+        shift_size -= NUM_REG;
+        match expect_token_serialized(iter, &[REGISTER], sym_table)? {
+            Serialized::Register(r) => {
+                instruction |= (r as u32) << shift_size;
+            }
+            _ => unreachable!(
+                "shouldn't see anything other than a register at this point! bug in the expect_token fn?"
+            ),
+        };
+        shift_size -= INPUT_MODE_SIZE;
+        match expect_token_serialized(iter, &[REGISTER, IMMEDIATE], sym_table)? {
+            Serialized::Register(r) => {
+                shift_size -= NUM_REG;
+                instruction |= (r as u32) << shift_size;
+            }
+            Serialized::Immediate(i) => {}
+            _ => unreachable!(
+                "shouldn't see anything other than a register or an immediate at this point! bug in the expect_token fn?"
+            ),
+        }
+    } else {
+        shift_size -= INPUT_MODE_SIZE;
+        match expect_token_serialized(iter, &[REGISTER, IMMEDIATE], sym_table)? {
+            Serialized::Register(r) => {
+                shift_size -= NUM_REG;
+                instruction |= (r as u32) << shift_size;
+            }
+            Serialized::Immediate(i) => {
+                if i >= (1 << 24) {
+                    Err(ParserError{
+                        line: 
+                    })
+                }
+            }
+            _ => unreachable!(
+                "shouldn't see anything other than a register at this point! bug in the expect_token fn?"
+            ),
+        }
+    }
+    Ok(instruction)
+}
+
 fn parse_instruction<I>(
     mnemonic: MnemonicT,
     iter: &mut I,
-    bytes: &mut Vec<u8>,
     sym_table: &HashMap<&'static str, u64>,
-) -> Result<(), ParserError>
+) -> Result<u32, ParserError>
 where
     I: Iterator<Item = Token>,
 {
     use MnemonicT::*;
     let mut instruction_half_word = mnemonic.serialiaze();
     match mnemonic {
-        Add | Sub | Mul | Xor | Or | Load | Store | Div | And | Cmp => {
+        Load | Store => match expect_token_serialized(iter, &[REGISTER], sym_table)? {
+            Serialized::Register(r) => {
+                instruction_half_word |= (r as u32) << 13;
+            }
+            _ => unreachable!(
+                "shouldn't see anything other than a register at this point! bug in the expect_token fn?"
+            ),
+        },
+        Add | Sub | Mul | Xor | Or | Div | And | Cmp | AddS | SubS | OrS => {
             // set op1 mode to 0 (register)
             // instruction_half_word |= 0 << 9;
             // get the first operand
-            match expect_token(iter, &[REGISTER], sym_table)? {
+            match expect_token_serialized(iter, &[REGISTER], sym_table)? {
                 Serialized::Register(r) => {
                     // leave the first 13 bits untouched and set op1 at the 13-18th bits
                     println!("register {r}");
@@ -620,9 +709,9 @@ where
                 _ => unreachable!("expected a register!"),
             };
             // consume the mandatory comma seperating the operands
-            expect_token(iter, &[COMMA], sym_table)?;
+            expect_token_serialized(iter, &[COMMA], sym_table)?;
             // get the second operand
-            match expect_token(iter, &[REGISTER, POUND, DOLLAR], sym_table)? {
+            match expect_token_serialized(iter, &[REGISTER, POUND, DOLLAR], sym_table)? {
                 Serialized::Register(r) => {
                     // set op2 mode to 0 (register)
                     // instruction_half_word |= 0 << 11;
@@ -638,7 +727,7 @@ where
                     // set op2 mode to 1 (register indirect)
                     instruction_half_word |= 1 << 11;
                     // get second operand
-                    match expect_token(iter, &[REGISTER], sym_table)? {
+                    match expect_token_serialized(iter, &[REGISTER], sym_table)? {
                         Serialized::Register(r) => {
                             // leave the first 18 bits alone and set op2 at the 18-23th bits
                             instruction_half_word |= (r as u32) << 18;
@@ -656,7 +745,7 @@ where
                     // set op2 mode to 2 (immediate)
                     instruction_half_word |= 2 << 11;
                     // get second operand
-                    match expect_token(iter, &[IMMEDIATE], sym_table)? {
+                    match expect_token_serialized(iter, &[IMMEDIATE], sym_table)? {
                         Serialized::Immediate(arg) => {
                             // we can't fit the second instruction in a u32 so we pad the 5
                             // remaining bits (18 to 24) with 0 (already 0 so do nothing),
@@ -681,7 +770,7 @@ where
         Jmp | Jnz | Jz | Not | Call => {
             // these instructions only have one argument
             // get the first argument
-            match expect_token(iter, &[REGISTER, POUND, DOLLAR], sym_table)? {
+            match expect_token_serialized(iter, &[REGISTER, POUND, DOLLAR], sym_table)? {
                 Serialized::Register(r) => {
                     // set op1 mode to 0 (register)
                     instruction_half_word |= 0 << 9;
@@ -697,7 +786,7 @@ where
                     // set op1 mode to 1 (register indirect)
                     instruction_half_word |= 1 << 9;
                     // get second operand
-                    match expect_token(iter, &[REGISTER], sym_table)? {
+                    match expect_token_serialized(iter, &[REGISTER], sym_table)? {
                         Serialized::Register(r) => {
                             // since these instructions don't have a second argument,
                             // we can write the register into the 11th-16th bits of the u32 (then cast to
@@ -714,7 +803,7 @@ where
                     // set op1 mode to 2 (immediate)
                     instruction_half_word |= 2 << 9;
                     // get actual operand
-                    match expect_token(iter, &[IMMEDIATE], sym_table)? {
+                    match expect_token_serialized(iter, &[IMMEDIATE], sym_table)? {
                         Serialized::Immediate(arg) => {
                             // the operand is a u64 so we push the first 16 bits (9 for the ins, 2
                             // for the operand mode and the remaining 5 bits as a pad)
@@ -754,12 +843,12 @@ fn parse_assembly(asm: &str) -> Result<Vec<u8>, ParserError> {
     {
         match token_kind {
             TokenKind::Label(label) => {
-                expect_token(&mut token_iter, &[COLON], &sym_table).map(|_| {
+                expect_token_serialized(&mut token_iter, &[COLON], &sym_table).map(|_| {
                     sym_table.insert(label, bytes.len() as u64);
                 })?;
             }
             TokenKind::Mnemonic(mnemonic) => {
-                parse_instruction(mnemonic, &mut token_iter, &mut bytes, &sym_table)?;
+                parse_instruction(mnemonic, &mut token_iter, &sym_table)?;
             }
             _ => {
                 return Err(ParserError {
